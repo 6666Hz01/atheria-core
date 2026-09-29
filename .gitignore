@@ -1,0 +1,4 @@
+atheria_env/
+*.pyc
+__pycache__/
+.env

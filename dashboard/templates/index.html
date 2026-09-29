@@ -1,0 +1,23 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Atheria Core Dashboard</title>
+    <style>
+        body { background: #0a0a0a; color: #00ffcc; font-family: monospace; }
+        .panel { border: 1px solid #333; padding: 20px; margin: 10px; border-radius: 10px; }
+        h1 { color: #fff; text-shadow: 0 0 10px #00ffcc; }
+    </style>
+</head>
+<body>
+    <h1>ATHERIA CORE: COMMAND CENTER</h1>
+    <div class="panel">
+        <h2>STATUS: ACTIVE</h2>
+        <p>سیستم در حال مانیتورینگ است...</p>
+    </div>
+    <div class="panel">
+        <h2>RECENT LOGS</h2>
+        <ul>{% for log in logs %}<li>{{ log }}</li>{% endfor %}</ul>
+    </div>
+</body>
+</html>

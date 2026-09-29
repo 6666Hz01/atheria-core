@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+# Atheria Boot — compact core + supervised self-upgrade (no silent core replace)
+import os, re, time, logging, sqlite3, threading, subprocess, shutil, tempfile, asyncio
+from pathlib import Path
+import requests
+from dotenv import load_dotenv
+
+BASE = Path(__file__).resolve().parent
+load_dotenv(BASE / ".env")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+KEY = (os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+OWNER = os.getenv("OWNER_ID", "").strip()
+DB = Path(os.getenv("DB_PATH", str(BASE / "atheria.db")))
+MODEL = os.getenv("MODEL", "openai/gpt-oss-120b").strip()
+TTS_VOICE = os.getenv("TTS_VOICE", "fa-IR-DilaraNeural").strip()
+VOICE_REPLY = os.getenv("VOICE_REPLY", "1").strip() == "1"
+WHISPER = os.getenv("WHISPER_MODEL", "whisper-large-v3").strip()
+GROQ = "https://api.groq.com/openai/v1/chat/completions"
+STT = "https://api.groq.com/openai/v1/audio/transcriptions"
+TG = f"https://api.telegram.org/bot{TOKEN}"
+WORK = BASE / "workspace"
+WORK.mkdir(exist_ok=True)
+BAD = ["rm -rf", "sudo ", "drop table", "/dev/"]
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("ath")
+
+
+def db():
+    c = sqlite3.connect(DB, timeout=30)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    return c
+
+
+def init():
+    with db() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS tasks(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INT, goal TEXT,
+              status TEXT DEFAULT 'pending', response TEXT, created_at REAL, updated_at REAL);
+            CREATE TABLE IF NOT EXISTS proposals(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INT, title TEXT, body TEXT,
+              status TEXT DEFAULT 'draft', created_at REAL);
+            """
+        )
+
+
+def allowed(cid):
+    return (not OWNER) or str(cid) == str(OWNER)
+
+
+def bad(s):
+    s = (s or "").lower()
+    return any(x in s for x in BAD)
+
+
+def tg(cid, text):
+    text = (text or "")[:4000]
+    for i in range(1, 4):
+        try:
+            r = requests.post(f"{TG}/sendMessage", json={"chat_id": cid, "text": text}, timeout=30)
+            if r.status_code == 200:
+                return True
+        except Exception as e:
+            log.error("tg %s", e)
+            time.sleep(2**i)
+    return False
+
+
+def speak(cid, text):
+    tg(cid, text)
+    if not VOICE_REPLY:
+        return
+    clip = re.sub(r"[#*_`]+", " ", text)
+    clip = re.sub(r"\s+", " ", clip).strip()[:400]
+    if not clip:
+        return
+    path = Path(tempfile.gettempdir()) / f"a{int(time.time()*1000)}.mp3"
+    try:
+        import edge_tts
+
+        async def gen():
+            await edge_tts.Communicate(clip, TTS_VOICE).save(str(path))
+
+        asyncio.run(gen())
+        with open(path, "rb") as f:
+            requests.post(
+                f"{TG}/sendAudio",
+                data={"chat_id": cid, "title": "Atheria"},
+                files={"audio": ("a.mp3", f)},
+                timeout=60,
+            )
+    except Exception as e:
+        log.error("tts %s", e)
+        try:
+            subprocess.Popen(["termux-tts-speak", clip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def llm(sys, user, n=1400):
+    if not KEY:
+        return "API key missing"
+    h = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
+    body = {"model": MODEL, "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}], "max_tokens": n, "temperature": 0.4}
+    for i in range(1, 4):
+        try:
+            r = requests.post(GROQ, headers=h, json=body, timeout=120)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"]
+            if r.status_code in (429, 500, 502, 503):
+                time.sleep(2**i)
+                continue
+            return f"API {r.status_code}"
+        except Exception as e:
+            if i == 3:
+                return str(e)
+            time.sleep(2**i)
+    return "fail"
+
+
+def py_block(t):
+    m = re.search(r"```(?:python)?\s*([\s\S]*?)```", t or "")
+    return (m.group(1) if m else t or "").strip()
+
+
+def add_task(cid, goal):
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO tasks(chat_id,goal,status,created_at,updated_at) VALUES(?,?,'pending',?,?)",
+            (cid, goal, time.time(), time.time()),
+        )
+        c.commit()
+        return int(cur.lastrowid)
+
+
+def pop_task():
+    with db() as c:
+        r = c.execute("SELECT * FROM tasks WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
+        return dict(r) if r else None
+
+
+def finish(tid, resp):
+    with db() as c:
+        c.execute(
+            "UPDATE tasks SET status='completed', response=?, updated_at=? WHERE id=?",
+            (resp, time.time(), tid),
+        )
+        c.commit()
+
+
+def add_prop(cid, title, body):
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO proposals(chat_id,title,body,status,created_at) VALUES(?,?,?,'draft',?)",
+            (cid, title, body, time.time()),
+        )
+        c.commit()
+        return int(cur.lastrowid)
+
+
+def prop(pid):
+    with db() as c:
+        r = c.execute("SELECT * FROM proposals WHERE id=?", (pid,)).fetchone()
+        return dict(r) if r else None
+
+
+def set_prop(pid, st):
+    with db() as c:
+        c.execute("UPDATE proposals SET status=? WHERE id=?", (st, pid))
+        c.commit()
+
+def stt(file_id):
+    try:
+        if not KEY:
+            return "[stt no api key]"
+        r = requests.get(f"{TG}/getFile", params={"file_id": file_id}, timeout=30)
+        r.raise_for_status()
+        fp = r.json()["result"]["file_path"]
+        data = requests.get(f"https://api.telegram.org/file/bot{TOKEN}/{fp}", timeout=60)
+        data.raise_for_status()
+        # Telegram voice is OGG/Opus — name must end with .ogg for Groq
+        path = Path(tempfile.gettempdir()) / f"tg_voice_{int(time.time())}.ogg"
+        path.write_bytes(data.content)
+        models = [WHISPER, "whisper-large-v3", "whisper-large-v3-turbo"]
+        last = ""
+        for model in models:
+            for lang in ("fa", None):
+                with open(path, "rb") as f:
+                    form = {"model": model}
+                    if lang:
+                        form["language"] = lang
+                    r2 = requests.post(
+                        STT,
+                        headers={"Authorization": f"Bearer {KEY}"},
+                        files={"file": ("voice.ogg", f, "audio/ogg")},
+                        data=form,
+                        timeout=180,
+                    )
+                if r2.status_code == 200:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    return (r2.json().get("text") or "").strip()
+                last = f"[stt {r2.status_code} model={model} {r2.text[:120]}]"
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return last or "[stt failed]"
+    except Exception as e:
+        return f"[stt {e}]"
+
+
+def handle(cid, text):
+    if not allowed(cid):
+        tg(cid, "denied")
+        return
+    if text in ("/start", "/help"):
+        speak(
+            cid,
+            "آتریا Boot. متن یا صوت بفرست.\n"
+            "/seed هدف\n/code اسکریپت\n/run فایل\n/files\n"
+            "/upgrade توضیح قابلیت\n/export شماره\n/approve شماره\n"
+            "/apply شماره → atheria_next.py (هسته را خودکار عوض نمی‌کند)\n"
+            "/status /last",
+        )
+        return
+    if text.startswith("/seed "):
+        tg(cid, f"Task #{add_task(cid, text[6:].strip())}")
+        return
+    if text.startswith("/code "):
+        raw = llm("One safe Python script only in ```python```. No destructive commands.", text[6:], 1600)
+        code = py_block(raw)
+        if bad(code):
+            tg(cid, "blocked")
+            return
+        name = f"c{int(time.time())}.py"
+        (WORK / name).write_text(code + "\n", encoding="utf-8")
+        tg(cid, f"saved {name}\n/run {name}\n{code[:2500]}")
+        return
+    if text.startswith("/run "):
+        name = text[5:].strip()
+        if not re.fullmatch(r"[\w.\-]+", name):
+            tg(cid, "bad name")
+            return
+        path = WORK / name
+        if not path.exists():
+            tg(cid, "missing")
+            return
+        try:
+            p = subprocess.run(["python", str(path)], cwd=str(WORK), capture_output=True, text=True, timeout=45)
+            tg(cid, f"exit={p.returncode}\n{((p.stdout or '')+(p.stderr or ''))[-1800]}")
+        except Exception as e:
+            tg(cid, str(e))
+        return
+    if text == "/files":
+        tg(cid, "\n".join(sorted(x.name for x in WORK.glob('*.py'))[-20:]) or "empty")
+        return
+    if text.startswith("/upgrade "):
+        goal = text[9:].strip()
+        body = llm(
+            "Upgrade plan for this Telegram Python bot. Include full replacement file OR module in ```python```. Safe, incremental. Note restart steps.",
+            f"Add/change: {goal}\nCurrent: single-file bot with tasks, workspace /code, proposals, optional edge-tts voice.",
+            2000,
+        )
+        pid = add_prop(cid, goal[:80], body)
+        tg(cid, f"Proposal #{pid}\n/export {pid} then show Grok\n/approve {pid}\n/apply {pid}\n\n{body[:2000]}")
+        return
+    if text.startswith("/export "):
+        parts = text.split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            tg(cid, "Usage /export id")
+            return
+        p = prop(int(parts[1]))
+        if not p:
+            tg(cid, "missing")
+            return
+        msg = f"HANDOFF #{p['id']} [{p['status']}]\n{p['title']}\n\n{p['body']}"
+        for i in range(0, len(msg), 3500):
+            tg(cid, msg[i : i + 3500])
+        return
+    if text.startswith("/approve "):
+        parts = text.split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            tg(cid, "Usage /approve id")
+            return
+        if not prop(int(parts[1])):
+            tg(cid, "missing")
+            return
+        set_prop(int(parts[1]), "approved")
+        tg(cid, f"approved #{parts[1]} — next /apply {parts[1]}")
+        return
+    if text.startswith("/apply "):
+        parts = text.split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            tg(cid, "Usage /apply id")
+            return
+        if OWNER and str(cid) != str(OWNER):
+            tg(cid, "owner only")
+            return
+        p = prop(int(parts[1]))
+        if not p or p["status"] not in ("approved", "draft"):
+            tg(cid, "need existing proposal (prefer /approve first)")
+            return
+        code = py_block(p["body"])
+        if len(code) < 100 or bad(code):
+            tg(cid, "no safe full python in proposal — ask for complete file in upgrade")
+            return
+        bak = BASE / f"bak_{int(time.time())}.py"
+        if (BASE / "atheria.py").exists():
+            shutil.copy2(BASE / "atheria.py", bak)
+        (BASE / "atheria_next.py").write_text(code + "\n", encoding="utf-8")
+        set_prop(int(parts[1]), "written_next")
+        tg(
+            cid,
+            f"wrote atheria_next.py (backup {bak.name})\n"
+            "YOU run once in Termux:\n"
+            "cp atheria_next.py atheria.py; pkill -f atheria.py; nohup python atheria.py > atheria.log 2>&1 &",
+        )
+        return
+    if text == "/status":
+        with db() as c:
+            rows = c.execute("SELECT status,COUNT(*) FROM tasks WHERE chat_id=? GROUP BY status", (cid,)).fetchall()
+        tg(cid, " | ".join(f"{a}:{b}" for a, b in rows) if rows else "empty")
+        return
+    if text == "/last":
+        with db() as c:
+            r = c.execute("SELECT * FROM tasks WHERE chat_id=? ORDER BY id DESC LIMIT 1", (cid,)).fetchone()
+        if not r:
+            tg(cid, "empty")
+            return
+        r = dict(r)
+        tg(cid, f"#{r['id']} {r['goal']}\n{r.get('response') or ''}"[:3900])
+        return
+    tg(cid, f"Task #{add_task(cid, text)}")
+
+
+class App:
+    def __init__(self):
+        self.off = 0
+        self.ok = True
+
+    def poll(self):
+        while self.ok:
+            try:
+                r = requests.get(f"{TG}/getUpdates", params={"offset": self.off, "timeout": 25}, timeout=40)
+                if r.status_code != 200:
+                    time.sleep(5)
+                    continue
+                for u in r.json().get("result", []):
+                    self.off = max(self.off, u["update_id"] + 1)
+                    m = u.get("message") or {}
+                    cid = (m.get("chat") or {}).get("id")
+                    if not cid:
+                        continue
+                    if m.get("voice"):
+                        t = stt(m["voice"]["file_id"])
+                        tg(cid, f"heard: {t[:800]}")
+                        if t and not t.startswith("["):
+                            handle(cid, t)
+                    elif (m.get("text") or "").strip():
+                        handle(cid, m["text"].strip())
+            except Exception as e:
+                log.error("poll %s", e)
+                time.sleep(8)
+
+    def work(self):
+        while self.ok:
+            try:
+                t = pop_task()
+                if not t:
+                    time.sleep(3)
+                    continue
+                ans = llm(
+                    "Atheria personal AI. Practical. Persian if user Persian. Explain upgrade flow if asked.",
+                    t["goal"],
+                    1400,
+                )
+                finish(t["id"], ans)
+                speak(t["chat_id"], f"Done #{t['id']}\n{ans[:3000]}")
+            except Exception as e:
+                log.error("work %s", e)
+                time.sleep(5)
+
+    def run(self):
+        if not TOKEN:
+            log.error("no token")
+            return
+        init()
+        log.info("Atheria Boot up tts=%s voice=%s", TTS_VOICE, VOICE_REPLY)
+        threading.Thread(target=self.poll, daemon=True).start()
+        threading.Thread(target=self.work, daemon=True).start()
+        while True:
+            time.sleep(1)
+
+
+if __name__ == "__main__":
+    App().run()

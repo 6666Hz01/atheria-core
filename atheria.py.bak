@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+import os, time, logging, sqlite3, threading
+from pathlib import Path
+import requests
+from dotenv import load_dotenv
+
+BASE = Path(__file__).resolve().parent
+load_dotenv(BASE / ".env")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+KEY = (os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+OWNER = os.getenv("OWNER_ID", "").strip()
+DB = Path(os.getenv("DB_PATH", str(BASE / "atheria.db")))
+MODEL = os.getenv("MODEL", "openai/gpt-oss-120b").strip()
+GROQ = "https://api.groq.com/openai/v1/chat/completions"
+TG = f"https://api.telegram.org/bot{TOKEN}"
+SENS = ["خودتو ارتقا", "self improve", "rm -", "delete file", "execute shell", "pip install"]
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("atheria")
+
+def db():
+    c = sqlite3.connect(DB, timeout=30)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    return c
+
+def init():
+    with db() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS tasks(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER, goal TEXT, status TEXT DEFAULT 'pending',
+            response TEXT, requires_approval INTEGER DEFAULT 0,
+            created_at REAL, updated_at REAL)""")
+
+def add_task(chat_id, goal):
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO tasks(chat_id,goal,status,created_at,updated_at) VALUES(?,?,'pending',?,?)",
+            (chat_id, goal, time.time(), time.time()))
+        c.commit()
+        return cur.lastrowid
+
+def pending():
+    with db() as c:
+        r = c.execute("SELECT * FROM tasks WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
+        return dict(r) if r else None
+
+def done(tid, response, req=0):
+    with db() as c:
+        c.execute("UPDATE tasks SET status='completed', response=?, requires_approval=?, updated_at=? WHERE id=?",
+                  (response, req, time.time(), tid))
+        c.commit()
+
+def last(chat_id):
+    with db() as c:
+        r = c.execute("SELECT * FROM tasks WHERE chat_id=? ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
+        return dict(r) if r else None
+
+def hist(chat_id):
+    with db() as c:
+        return [dict(x) for x in c.execute(
+            "SELECT id,goal,status FROM tasks WHERE chat_id=? ORDER BY id DESC LIMIT 5", (chat_id,))]
+
+def cancel(chat_id):
+    with db() as c:
+        cur = c.execute("UPDATE tasks SET status='cancelled' WHERE chat_id=? AND status='pending'", (chat_id,))
+        c.commit()
+        return cur.rowcount
+
+def approve(tid):
+    with db() as c:
+        c.execute("UPDATE tasks SET status='approved' WHERE id=?", (tid,))
+        c.commit()
+
+def tg(chat_id, text):
+    if not TOKEN or not chat_id:
+        return False
+    try:
+        r = requests.post(f"{TG}/sendMessage", json={"chat_id": chat_id, "text": text[:4000]}, timeout=30)
+        return r.status_code == 200
+    except Exception as e:
+        log.error("tg %s", e)
+        return False
+
+def ask(prompt):
+    if not KEY:
+        return "Error: API key missing in .env"
+    headers = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
+    body = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": "You are Atheria, practical AI assistant. Clear steps. Match user language."},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 1200,
+        "temperature": 0.5,
+    }
+    for i in range(1, 4):
+        try:
+            r = requests.post(GROQ, headers=headers, json=body, timeout=90)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"]
+            if r.status_code in (429, 500, 502, 503):
+                time.sleep(2 ** i)
+                continue
+            return f"API Error {r.status_code}: {r.text[:150]}"
+        except Exception as e:
+            if i == 3:
+                return f"Error: {e}"
+            time.sleep(2 ** i)
+    return "Failed"
+
+def sensitive(g):
+    g = g.lower()
+    return any(s.lower() in g for s in SENS)
+
+def allowed(chat_id):
+    return (not OWNER) or str(chat_id) == str(OWNER)
+
+def handle(chat_id, text):
+    if not allowed(chat_id):
+        tg(chat_id, "Access denied")
+        return
+    if text in ("/start", "/help"):
+        tg(chat_id, "Atheria Live\n/seed <goal>\n/status /last /history\n/approve /cancel\nOr type a goal.")
+        return
+    if text.startswith("/seed "):
+        goal = text[6:].strip()
+        if not goal:
+            tg(chat_id, "Usage: /seed <goal>")
+            return
+        tid = add_task(chat_id, goal)
+        tg(chat_id, f"Task #{tid} queued\n{goal}")
+        return
+    if text == "/status":
+        with db() as c:
+            rows = c.execute("SELECT status, COUNT(*) FROM tasks WHERE chat_id=? GROUP BY status", (chat_id,)).fetchall()
+        tg(chat_id, " | ".join(f"{s}:{n}" for s, n in rows) if rows else "empty")
+        return
+    if text == "/last":
+        t = last(chat_id)
+        if not t:
+            tg(chat_id, "No tasks")
+            return
+        tg(chat_id, f"#{t['id']} [{t['status']}]\n{t['goal']}\n\n{t.get('response') or ''}"[:3900])
+        return
+    if text == "/history":
+        rows = hist(chat_id)
+        tg(chat_id, "\n".join(f"#{r['id']} [{r['status']}] {r['goal'][:40]}" for r in rows) if rows else "empty")
+        return
+    if text.startswith("/approve"):
+        parts = text.split()
+        tid = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else (last(chat_id) or {}).get("id")
+        if not tid:
+            tg(chat_id, "nothing")
+            return
+        approve(int(tid))
+        tg(chat_id, f"Approved #{tid}")
+        return
+    if text == "/cancel":
+        tg(chat_id, f"cancelled {cancel(chat_id)}")
+        return
+    tid = add_task(chat_id, text)
+    tg(chat_id, f"Task #{tid} queued\n{text}")
+
+class App:
+    def __init__(self):
+        self.offset = 0
+        self.ok = True
+
+    def poll(self):
+        while self.ok:
+            try:
+                r = requests.get(f"{TG}/getUpdates", params={"offset": self.offset, "limit": 20, "timeout": 25}, timeout=35)
+                if r.status_code != 200:
+                    time.sleep(3)
+                    continue
+                for u in r.json().get("result", []):
+                    self.offset = max(self.offset, u["update_id"] + 1)
+                    m = u.get("message")
+                    if not m:
+                        continue
+                    t = (m.get("text") or "").strip()
+                    if t:
+                        handle(m["chat"]["id"], t)
+            except Exception as e:
+                log.error("poll %s", e)
+                time.sleep(5)
+
+    def worker(self):
+        while self.ok:
+            try:
+                t = pending()
+                if not t:
+                    time.sleep(3)
+                    continue
+                tid, goal, chat_id = t["id"], t["goal"], t["chat_id"]
+                tg(chat_id, f"Processing #{tid}...\n{goal}")
+                ans = ask(f"Goal: {goal}\n\nClear practical answer with steps.")
+                req = 1 if sensitive(goal) else 0
+                done(tid, ans, req)
+                msg = f"Done #{tid}\n\n{ans[:3200]}"
+                if req:
+                    msg += "\n\nSensitive — /approve if needed"
+                tg(chat_id, msg)
+                time.sleep(1)
+            except Exception as e:
+                log.error("worker %s", e)
+                time.sleep(5)
+
+    def run(self):
+        if not TOKEN:
+            log.error("TELEGRAM_BOT_TOKEN missing")
+            return
+        if not KEY:
+            log.warning("API key missing")
+        init()
+        log.info("Atheria Live started model=%s", MODEL)
+        threading.Thread(target=self.poll, daemon=True).start()
+        threading.Thread(target=self.worker, daemon=True).start()
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.ok = False
+
+if __name__ == "__main__":
+    App().run()
